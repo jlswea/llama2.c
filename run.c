@@ -585,6 +585,8 @@ typedef struct {
     float temperature;
     float topp;
     unsigned long long rng_state;
+    int green_list_size;
+    float* green_list_logits;
 } Sampler;
 
 int sample_argmax(float* probabilities, int n) {
@@ -664,17 +666,20 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
     return probindex[last_idx].index; // in case of rounding errors
 }
 
-void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
+void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed, int green_list_size) {
     sampler->vocab_size = vocab_size;
     sampler->temperature = temperature;
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
     sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+    sampler->green_list_size = green_list_size;
+    sampler->green_list_logits = malloc(sampler->green_list_size * sizeof(float));
 }
 
 void free_sampler(Sampler* sampler) {
     free(sampler->probindex);
+    free(sampler->green_list_logits);
 }
 
 unsigned int random_u32(unsigned long long *state) {
@@ -688,7 +693,7 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
-int sample(Sampler* sampler, float* logits) {
+int sample(Sampler* sampler, float* logits, int watermark, int token) {
     // sample the token given the logits and some hyperparameters
     int next;
     if (sampler->temperature == 0.0f) {
@@ -699,6 +704,27 @@ int sample(Sampler* sampler, float* logits) {
         for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
         // apply softmax to the logits to get the probabilities for next token
         softmax(logits, sampler->vocab_size);
+        // Create a red list by setting the probabilities to zero
+        if (watermark) {
+            // Seed the random number generator with the previous tokens index in vocab. 
+            // This is used as a replacement for a hash
+            srand(token);
+            // Running index of the green list to keep track of its size.
+            // Should be config.vocab_size / 2.
+            int gl_idx = 0; 
+            for (int i = 0; i < sampler->vocab_size; i++) {
+                int boolean = rand() % 2; // Get a random boolean value
+                if (boolean) {
+                    //fprintf(stderr, "Logit at %i with value %f, will be red listed\n", i, logits[i]);
+                    logits[i] = 0.0f;
+                    gl_idx++;
+                }
+                if (gl_idx >= sampler->vocab_size / 2) {
+                    break;
+                }
+            }
+            //fprintf(stderr, "%i token red listed\n", gl_idx);
+        }
         // flip a (float) coin (this is our source of entropy for sampling)
         float coin = random_f32(&sampler->rng_state);
         // we sample from this distribution to get the next token
@@ -726,7 +752,7 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, int watermark, int detect) {
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
@@ -744,27 +770,55 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     int next;        // will store the next token in the sequence
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;     // position in the sequence
+    int red_list_items = 0;
+    int green_list_items = 0;
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
         float* logits = forward(transformer, token, pos);
 
         // advance the state machine
-        if (pos < num_prompt_tokens - 1) {
+        if (pos < num_prompt_tokens - 1 && !detect) {
             // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos + 1];
         } else {
-            // otherwise sample the next token from the logits
-            next = sample(sampler, logits);
+            // otherwise sample the next token from the logits if no watermark is applied
+            next = sample(sampler, logits, watermark, token);
         }
         pos++;
 
         // data-dependent terminating condition: the BOS (=1) token delimits sequences
         if (next == 1) { break; }
 
-        // print the token as string, decode it with the Tokenizer object
+        // Decode it with the Tokenizer object
         char* piece = decode(tokenizer, token, next);
+
+        // Print the output
         safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        
+        // Check the hard red list rule if in detect mode
+        if (detect) {
+            // Seed the random number generator with the previous tokens index in vocab. 
+            // This is used as a replacement for a hash
+            srand(token);
+            // Getting 'next' random numbers. The last one is expected to be the boolean that decides 
+            // wether 'next' is on the red list.
+            // boolean = 1 -> red list
+            // boolean = 0 -> green list
+            int boolean;
+            for (int i = 0; i < next+1; i++) {
+                boolean = rand() % 2; // Get a random boolean value
+            }
+            if (boolean) {
+                printf("(r)");
+                red_list_items++;
+                } 
+            else {
+                printf("(g)");
+                green_list_items++;
+            }
+        }
+
         fflush(stdout);
         token = next;
 
@@ -777,6 +831,10 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     if (pos > 1) {
         long end = time_in_ms();
         fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-start)*1000);
+    }
+
+    if (detect) {
+        fprintf(stderr, "Number of green_list items: %i\nNumber of red_list items: %i\n", green_list_items, red_list_items);
     }
 
     free(prompt_tokens);
@@ -794,97 +852,6 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 }
 
 // ----------------------------------------------------------------------------
-// chat loop
-// I manually inspected the tokens for a few chat conversations compared to
-// python reference and that seemed ok, but this was not thoroughly tested and
-// is not safely implemented, it's more a proof of concept atm.
-
-void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-          char *cli_user_prompt, char *cli_system_prompt, int steps) {
-
-    // buffers for reading the system prompt and user prompt from stdin
-    // you'll notice they are soomewhat haphazardly and unsafely set atm
-    char system_prompt[512];
-    char user_prompt[512];
-    char rendered_prompt[1152];
-    int num_prompt_tokens = 0;
-    int* prompt_tokens = (int*)malloc(1152 * sizeof(int));
-    int user_idx;
-
-    // start the main loop
-    int8_t user_turn = 1; // user starts
-    int next;        // will store the next token in the sequence
-    int token;       // stores the current token to feed into the transformer
-    int prev_token;
-    int pos = 0;     // position in the sequence
-    while (pos < steps) {
-
-        // when it is the user's turn to contribute tokens to the dialog...
-        if (user_turn) {
-            // get the (optional) system prompt at position 0
-            if (pos == 0) {
-                // at position 0, the user can also contribute a system prompt
-                if (cli_system_prompt == NULL) {
-                    // system prompt was not passed in, attempt to get it from stdin
-                    read_stdin("Enter system prompt (optional): ", system_prompt, sizeof(system_prompt));
-                } else {
-                    // system prompt was passed in, use it
-                    strcpy(system_prompt, cli_system_prompt);
-                }
-            }
-            // get the user prompt
-            if (pos == 0 && cli_user_prompt != NULL) {
-                // user prompt for position 0 was passed in, use it
-                strcpy(user_prompt, cli_user_prompt);
-            } else {
-                // otherwise get user prompt from stdin
-                read_stdin("User: ", user_prompt, sizeof(user_prompt));
-            }
-            // render user/system prompts into the Llama 2 Chat schema
-            if (pos == 0 && system_prompt[0] != '\0') {
-                char system_template[] = "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]";
-                sprintf(rendered_prompt, system_template, system_prompt, user_prompt);
-            } else {
-                char user_template[] = "[INST] %s [/INST]";
-                sprintf(rendered_prompt, user_template, user_prompt);
-            }
-            // encode the rendered prompt into tokens
-            encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-            user_idx = 0; // reset the user index
-            user_turn = 0;
-            printf("Assistant: ");
-        }
-
-        // determine the token to pass into the transformer next
-        if (user_idx < num_prompt_tokens) {
-            // if we are still processing the input prompt, force the next prompt token
-            token = prompt_tokens[user_idx++];
-        } else {
-            // otherwise use the next token sampled from previous turn
-            token = next;
-        }
-        // EOS (=2) token ends the Assistant turn
-        if (token == 2) { user_turn = 1; }
-
-        // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
-        next = sample(sampler, logits);
-        pos++;
-
-        if (user_idx >= num_prompt_tokens && next != 2) {
-            // the Assistant is responding, so print its output
-            char* piece = decode(tokenizer, token, next);
-            safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-            fflush(stdout);
-        }
-        if (next == 2) { printf("\n"); }
-    }
-    printf("\n");
-    free(prompt_tokens);
-}
-
-
-// ----------------------------------------------------------------------------
 // CLI, include only if not testing
 #ifndef TESTING
 
@@ -898,7 +865,7 @@ void error_usage() {
     fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
     fprintf(stderr, "  -i <string> input prompt\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-    fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
+    fprintf(stderr, "  -m <string> mode: generate|watermark, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
     exit(EXIT_FAILURE);
 }
@@ -913,7 +880,7 @@ int main(int argc, char *argv[]) {
     int steps = 256;            // number of steps to run for
     char *prompt = NULL;        // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
-    char *mode = "generate";    // generate|chat
+    char *mode = "generate";    // generate|watermark|detect
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
     // poor man's C argparse so we can override the defaults above from the command line
@@ -940,7 +907,7 @@ int main(int argc, char *argv[]) {
     if (temperature < 0.0) temperature = 0.0;
     if (topp < 0.0 || 1.0 < topp) topp = 0.9;
     if (steps < 0) steps = 0;
-
+ 
     // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path);
@@ -952,13 +919,15 @@ int main(int argc, char *argv[]) {
 
     // build the Sampler
     Sampler sampler;
-    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed, transformer.config.vocab_size);
 
     // run!
     if (strcmp(mode, "generate") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt, steps);
-    } else if (strcmp(mode, "chat") == 0) {
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+        generate(&transformer, &tokenizer, &sampler, prompt, steps, 0, 0);
+    } else if (strcmp(mode, "watermark") == 0) {
+        generate(&transformer, &tokenizer, &sampler, prompt, steps, 1, 0);
+    } else if (strcmp(mode, "detect") == 0) {
+        generate(&transformer, &tokenizer, &sampler, prompt, steps, 1, 1);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();

@@ -14,17 +14,10 @@ Please note that this repo started recently as a fun weekend project: I took my 
 
 ## feel the magic
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/karpathy/llama2.c/blob/master/run.ipynb)
-
 First, navigate to the folder where you keep your projects and clone this repository to this folder:
 
 ```bash
-git clone https://github.com/karpathy/llama2.c.git
-```
-
-Then, open the repository folder:
-
-```bash
+git clone https://github.com/jlswea/llama2.c.git
 cd llama2.c
 ```
 
@@ -48,21 +41,25 @@ wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories42M.bin
 ./run stories42M.bin
 ```
 
-This still runs at interactive rates and samples more coherent and diverse stories:
-
-> Once upon a time, there was a little girl named Lily. She loved playing with her toys on top of her bed. One day, she decided to have a tea party with her stuffed animals. She poured some tea into a tiny teapot and put it on top of the teapot. Suddenly, her little brother Max came into the room and wanted to join the tea party too. Lily didn't want to share her tea and she told Max to go away. Max started to cry and Lily felt bad. She decided to yield her tea party to Max and they both shared the teapot. But then, something unexpected happened. The teapot started to shake and wiggle. Lily and Max were scared and didn't know what to do. Suddenly, the teapot started to fly towards the ceiling and landed on the top of the bed. Lily and Max were amazed and they hugged each other. They realized that sharing was much more fun than being selfish. From that day on, they always shared their tea parties and toys.
-
 You can also prompt the model with a prefix or a number of additional command line arguments, e.g. to sample at temperature 0.8 for 256 steps and with a prompt:
 
 ```bash
 ./run stories42M.bin -t 0.8 -n 256 -i "One day, Lily met a Shoggoth"
 ```
 
-> One day, Lily met a Shoggoth. He was very shy, but was also very generous. Lily said “Hello Shoggy! Can I be your friend?” Shoggy was happy to have a friend and said “Yes, let’s explore the universe together!” So they set off on a journey to explore the universe. As they travelled, Shoggy was happy to explain to Lily about all the wonderful things in the universe. At the end of the day, Lily and Shoggy had gathered lots of wonderful things from the universe, and they both felt very proud. They promised to explore the universe as one big pair and to never stop being generous to each other.
-
 There is also an even better 110M param model available, see [models](#models).
 
 Quick note on sampling, the recommendation for ~best results is to sample with `-t 1.0 -p 0.9`, i.e. temperature 1.0 (default) but also top-p sampling at 0.9 (default). Intuitively, top-p ensures that tokens with tiny probabilities do not get sampled, so we can't get "unlucky" during sampling, and we are less likely to go "off the rails" afterwards. More generally, to control the diversity of samples use either the temperature (i.e. vary `-t` between 0 and 1 and keep top-p off with `-p 0`) or the top-p value (i.e. vary `-p` between 0 and 1 and keep `-t 1`), but not both. Nice explainers on LLM sampling strategies include [this](https://peterchng.com/blog/2023/05/02/token-selection-strategies-top-k-top-p-and-temperature/), [this](https://docs.cohere.com/docs/controlling-generation-with-top-k-top-p) or [this](https://huggingface.co/blog/how-to-generate).
+
+## Watermarking
+This fork implements the _hard_ red list rule by [Kirchenbauer et al.](https://arxiv.org/pdf/2301.10226.pdf). 
+The _watermark_ mode is invoked with `-m watermark` and currently only prints out the watermarked generated text to stderr while omitting the prompt. This can later be expanded to write to another file or to work in batch mode. The watermark is implemented according to Algorithm 1 of the original paper:
+
+1. Seed a rng with a hash of the previous token. Here the encoding of the token piece is used. This equates to the index of the token piece in the vocabulary, i.e.: `piece = vocab[token]`. There are no collisions by definition.
+2. Use the rng to separate the vocabulary into two equal sized groups, the red list and the green list. Here this is implemented by iterating over the probability vector and computing the boolean `rand() % 2`. If the boolean is true, the probability at the given index is set to zero. This essentially places the token in the red list since it cannot be sampled now. 
+3. Sample the next token as usual given the modified probability distribution.
+
+Running with `-m detect` watermarks the generated text and uses the same seed and rng to detect the watermark inline. This will append `(g)` to any green list item and `(r)` to potential red list items, even though with the _hard_ red list rule, there should be none. 
 
 ## Meta's Llama 2 models
 
@@ -81,36 +78,12 @@ The export will take ~10 minutes or so and generate a 26GB file (the weights of 
 
 This ran at about 4 tokens/s compiled with [OpenMP](#OpenMP) on 96 threads on my CPU Linux box in the cloud. (On my MacBook Air M1, currently it's closer to 30 seconds per token if you just build with `make runfast`.) Example output:
 
-> The purpose of this document is to highlight the state-of-the-art of CoO generation technologies, both recent developments and those in commercial use. The focus is on the technologies with the highest merit to become the dominating processes of the future and therefore to be technologies of interest to S&amp;T ... R&amp;D. As such, CoO generation technologies developed in Russia, Japan and Europe are described in some depth. The document starts with an introduction to cobalt oxides as complex products and a short view on cobalt as an essential material. The document continues with the discussion of the available CoO generation processes with respect to energy and capital consumption as well as to environmental damage.
-
-base models... ¯\\_(ツ)_/¯. Since we can inference the base model, it should be possible to also inference the chat model quite easily, and have a conversation with it. And if we can find a way to run 7B more efficiently, we can start adding LoRA to our training script, and going wild with finetunes all within the repo!
-
-You can also chat with the Llama Chat models. Export the chat model exactly as above:
-
-```bash
-python export.py llama2_7b_chat.bin --meta-llama /path/to/7B-chat
-```
-
-Then chat with it by specifying the chat mode using the `-m` flag, e.g.:
-
-```bash
-./run llama2_7b_chat.bin -m chat
-```
-
 You can also try Meta's Code Llama models even if support for them is incomplete. In particular, some hyperparameters changed (e.g. the constant in RoPE layer), so the inference is not exactly correct and a bit buggy right now. Looking into fixes. Make sure to build the tokenizer for the plain and instruct variants and pass it when doing inference.
 
 ```bash
 python export.py codellama2_7b.bin --meta-llama /path/to/CodeLlama-7b
 python tokenizer.py --tokenizer-model=/path/to/CodeLlama-7b/tokenizer.model
 ./run codellama2_7b.bin -z /path/to/CodeLlama-7b/tokenizer.bin
-```
-
-Chat with Code Llama Instruct:
-
-```bash
-python export.py codellama2_7b_instruct.bin --meta-llama /path/to/CodeLlama-7b-Instruct
-python tokenizer.py --tokenizer-model=/path/to/CodeLlama-7b-Instruct/tokenizer.model
-./run codellama2_7b_instruct.bin -m chat -z /path/to/CodeLlama-7b-Instruct/tokenizer.bin
 ```
 
 ## int8 quantization
