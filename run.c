@@ -570,6 +570,8 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     free(str_buffer);
 }
 
+
+
 // ----------------------------------------------------------------------------
 // The Sampler, which takes logits and returns a sampled token
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
@@ -585,8 +587,11 @@ typedef struct {
     float temperature;
     float topp;
     unsigned long long rng_state;
-    int green_list_size;
-    float* green_list_logits;
+    // Watermarking config
+    int watermarking;
+    char* watermarking_type;
+    float green_list_size;
+    float green_list_hardness;
 } Sampler;
 
 int sample_argmax(float* probabilities, int n) {
@@ -666,20 +671,30 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, f
     return probindex[last_idx].index; // in case of rounding errors
 }
 
-void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed, int green_list_size) {
-    sampler->vocab_size = vocab_size;
-    sampler->temperature = temperature;
-    sampler->topp = topp;
-    sampler->rng_state = rng_seed;
-    // buffer only used with nucleus sampling; may not need but it's ~small
-    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
-    sampler->green_list_size = green_list_size;
-    sampler->green_list_logits = malloc(sampler->green_list_size * sizeof(float));
+void build_sampler(
+        Sampler* sampler, 
+        int vocab_size, 
+        float temperature, 
+        float topp, 
+        unsigned long long rng_seed, 
+        float gl_size, 
+        float gl_hardness,
+        int watermarking,
+        char* watermarking_type
+    ) {
+        sampler->vocab_size = vocab_size;
+        sampler->temperature = temperature;
+        sampler->topp = topp;
+        sampler->rng_state = rng_seed;
+        sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex)); // buffer only used with nucleus sampling; may not need but it's ~small
+        sampler->green_list_size = gl_size;
+        sampler->green_list_hardness = gl_hardness;
+        sampler->watermarking = watermarking;
+        sampler->watermarking_type = watermarking_type;
 }
 
 void free_sampler(Sampler* sampler) {
     free(sampler->probindex);
-    free(sampler->green_list_logits);
 }
 
 unsigned int random_u32(unsigned long long *state) {
@@ -693,19 +708,12 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
-int sample(Sampler* sampler, float* logits, int watermark, int token) {
-    // sample the token given the logits and some hyperparameters
-    int next;
-    if (sampler->temperature == 0.0f) {
-        // greedy argmax sampling: take the token with the highest probability
-        next = sample_argmax(logits, sampler->vocab_size);
-    } else {
-        // apply the temperature to the logits
-        for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
-        // apply softmax to the logits to get the probabilities for next token
-        softmax(logits, sampler->vocab_size);
-        // Create a red list by setting the probabilities to zero
-        if (watermark) {
+void watermark(float* probabilities, Sampler* sampler, int token) {
+    if (sampler->watermarking == 0) { return; }
+    
+    // Apply a watermark 
+    else if (sampler->watermarking == 1) {
+        if (strcmp(sampler->watermarking_type, "hard") == 0) {
             // Seed the random number generator with the previous tokens index in vocab. 
             // This is used as a replacement for a hash
             srand(token);
@@ -713,31 +721,58 @@ int sample(Sampler* sampler, float* logits, int watermark, int token) {
             // Should be config.vocab_size / 2.
             int gl_idx = 0; 
             for (int i = 0; i < sampler->vocab_size; i++) {
-                int boolean = rand() % 2; // Get a random boolean value
-                if (boolean) {
-                    //fprintf(stderr, "Logit at %i with value %f, will be red listed\n", i, logits[i]);
-                    logits[i] = 0.0f;
+                if (rand() % 2) { // Get a random boolean value
+                    probabilities[i] = 0.0f;
                     gl_idx++;
                 }
-                if (gl_idx >= sampler->vocab_size / 2) {
+                if (gl_idx >= sampler->vocab_size * sampler->green_list_size) {
                     break;
                 }
             }
-            //fprintf(stderr, "%i token red listed\n", gl_idx);
-        }
-        // flip a (float) coin (this is our source of entropy for sampling)
-        float coin = random_f32(&sampler->rng_state);
-        // we sample from this distribution to get the next token
-        if (sampler->topp <= 0 || sampler->topp >= 1) {
-            // simply sample from the predicted probability distribution
-            next = sample_mult(logits, sampler->vocab_size, coin);
+        } else if (strcmp(sampler->watermarking_type, "soft") == 0) {
+            printf("Not yet implemented");
+            exit(EXIT_FAILURE);
         } else {
-            // top-p (nucleus) sampling, clamping the least likely tokens to zero
-            next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
+            fprintf(stderr, "Unknown watermarking_type\n");
+            exit(EXIT_FAILURE);
         }
+
+    // Error handling
+    } else { 
+        fprintf(stderr, "`Watermarking` is boolean, assert watermark is 0 or 1\n");
+        exit(EXIT_FAILURE);
     }
+}
+
+int sample(Sampler* sampler, float* logits, int token) {
+    // sample the token given the logits and some hyperparameters
+    int next;
+    
+    // apply the temperature to the logits
+    if (sampler->temperature > 0.0f) {
+    	for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
+    }
+    
+    // apply softmax to the logits to get the probabilities for next token
+    softmax(logits, sampler->vocab_size);
+    
+    // Apply the watermark by adjusting the probabilities over the vocab
+    watermark(logits, sampler, token);
+    
+    // flip a (float) coin (this is our source of entropy for sampling)
+    float coin = random_f32(&sampler->rng_state);
+    // we sample from this distribution to get the next token
+    if (sampler->topp <= 0 || sampler->topp >= 1) {
+        // simply sample from the predicted probability distribution
+        next = sample_mult(logits, sampler->vocab_size, coin);
+    } else {
+        // top-p (nucleus) sampling, clamping the least likely tokens to zero
+        next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
+    }
+    
     return next;
 }
+
 
 // ----------------------------------------------------------------------------
 // utilities: time
@@ -752,7 +787,7 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, int watermark, int detect) {
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, int detect) {
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
@@ -783,7 +818,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
             next = prompt_tokens[pos + 1];
         } else {
             // otherwise sample the next token from the logits if no watermark is applied
-            next = sample(sampler, logits, watermark, token);
+            next = sample(sampler, logits, token);
         }
         pos++;
 
@@ -865,7 +900,8 @@ void error_usage() {
     fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
     fprintf(stderr, "  -i <string> input prompt\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-    fprintf(stderr, "  -m <string> mode: generate|watermark, default: generate\n");
+    fprintf(stderr, "  -m <string> mode: generate|watermark|detect, default: generate\n");
+    fprintf(stderr, "  -w <string> watermarking type: {hard|soft}, default: soft\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
     exit(EXIT_FAILURE);
 }
@@ -873,15 +909,16 @@ void error_usage() {
 int main(int argc, char *argv[]) {
 
     // default parameters
-    char *checkpoint_path = NULL;  // e.g. out/model.bin
-    char *tokenizer_path = "tokenizer.bin";
-    float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-    float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-    int steps = 256;            // number of steps to run for
-    char *prompt = NULL;        // prompt string
-    unsigned long long rng_seed = 0; // seed rng with time by default
-    char *mode = "generate";    // generate|watermark|detect
-    char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
+    char* checkpoint_path = NULL;  		    // e.g. out/model.bin
+    char* tokenizer_path = "tokenizer.bin";
+    float temperature = 1.0f;   		    // 0.0 = greedy deterministic. 1.0 = original. don't set higher
+    float topp = 0.9f;          		    // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+    int steps = 256;            		    // number of steps to run for
+    char* prompt = NULL;        		    // prompt string
+    unsigned long long rng_seed = 0; 		// seed rng with time by default
+    char* mode = "generate";    		    // generate|watermark|detect
+    char* watermarking_type = "soft";		// {hard|soft}
+    char* system_prompt = NULL; 		    // the (optional) system prompt to use in chat mode
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -898,6 +935,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
         else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
+	    else if (argv[i][1] == 'w') { watermarking_type = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
         else { error_usage(); }
     }
@@ -919,15 +957,14 @@ int main(int argc, char *argv[]) {
 
     // build the Sampler
     Sampler sampler;
-    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed, transformer.config.vocab_size);
+    int apply_watermark = strcmp(mode, "detect") == 0 || strcmp(mode, "watermark") == 0;
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed, 0.5, 5.0, apply_watermark, watermarking_type);
 
     // run!
-    if (strcmp(mode, "generate") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt, steps, 0, 0);
-    } else if (strcmp(mode, "watermark") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt, steps, 1, 0);
+    if (strcmp(mode, "generate") == 0 || strcmp(mode, "watermark") == 0) {
+        generate(&transformer, &tokenizer, &sampler, prompt, steps, 0);
     } else if (strcmp(mode, "detect") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt, steps, 1, 1);
+        generate(&transformer, &tokenizer, &sampler, prompt, steps, 1);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();
