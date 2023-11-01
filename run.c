@@ -708,35 +708,31 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
-void watermark(float* probabilities, Sampler* sampler, int token) {
+void watermark(float* logits, Sampler* sampler, int token) {
     if (sampler->watermarking == 0) { return; }
     
     // Apply a watermark 
     else if (sampler->watermarking == 1) {
+        // Seed the random number generator with the previous tokens index in vocab. 
+        // This is used as a replacement for a hash
+        srand(token);
         if (strcmp(sampler->watermarking_type, "hard") == 0) {
-            // Seed the random number generator with the previous tokens index in vocab. 
-            // This is used as a replacement for a hash
-            srand(token);
-            // Running index of the green list to keep track of its size.
-            // Should be config.vocab_size / 2.
-            int gl_idx = 0; 
-            for (int i = 0; i < sampler->vocab_size; i++) {
-                if (rand() % 2) { // Get a random boolean value
-                    probabilities[i] = 0.0f;
-                    gl_idx++;
-                }
-                if (gl_idx >= sampler->vocab_size * sampler->green_list_size) {
-                    break;
-                }
+            // apply softmax to the logits to get the probabilities for next token
+            softmax(logits, sampler->vocab_size);
+            for (int i = 0; i < sampler->vocab_size * (1 - sampler->green_list_size); i++) {
+                int idx = rand() % sampler->vocab_size; // Get random index for vocab
+                logits[idx] = 0.0f;
             }
         } else if (strcmp(sampler->watermarking_type, "soft") == 0) {
-            printf("Not yet implemented");
-            exit(EXIT_FAILURE);
+            for (int i = 0; i < sampler->vocab_size * (1 - sampler->green_list_size); i++) {
+                int idx = rand() % sampler->vocab_size; // Get random index for vocab
+                logits[idx] -= sampler->green_list_hardness;
+            }
+            softmax(logits, sampler->vocab_size);
         } else {
             fprintf(stderr, "Unknown watermarking_type\n");
             exit(EXIT_FAILURE);
         }
-
     // Error handling
     } else { 
         fprintf(stderr, "`Watermarking` is boolean, assert watermark is 0 or 1\n");
@@ -752,9 +748,6 @@ int sample(Sampler* sampler, float* logits, int token) {
     if (sampler->temperature > 0.0f) {
     	for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
     }
-    
-    // apply softmax to the logits to get the probabilities for next token
-    softmax(logits, sampler->vocab_size);
     
     // Apply the watermark by adjusting the probabilities over the vocab
     watermark(logits, sampler, token);
@@ -836,15 +829,15 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
             // Seed the random number generator with the previous tokens index in vocab. 
             // This is used as a replacement for a hash
             srand(token);
-            // Getting 'next' random numbers. The last one is expected to be the boolean that decides 
-            // wether 'next' is on the red list.
-            // boolean = 1 -> red list
-            // boolean = 0 -> green list
-            int boolean;
-            for (int i = 0; i < next+1; i++) {
-                boolean = rand() % 2; // Get a random boolean value
+            int is_red_list_item= 0;
+            for (int i = 0; i < sampler->vocab_size * (1 - sampler->green_list_size); i++) {
+                int idx = rand() % sampler->vocab_size;
+                if (idx == next) {
+                    is_red_list_item = 1;
+                    break;
+                }
             }
-            if (boolean) {
+            if (is_red_list_item) {
                 printf("(r)");
                 red_list_items++;
                 } 
@@ -958,7 +951,7 @@ int main(int argc, char *argv[]) {
     // build the Sampler
     Sampler sampler;
     int apply_watermark = strcmp(mode, "detect") == 0 || strcmp(mode, "watermark") == 0;
-    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed, 0.5, 5.0, apply_watermark, watermarking_type);
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed, 0.5, 0.1, apply_watermark, watermarking_type);
 
     // run!
     if (strcmp(mode, "generate") == 0 || strcmp(mode, "watermark") == 0) {
